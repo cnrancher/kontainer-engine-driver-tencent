@@ -1,36 +1,56 @@
 ---
-pipeline:
-  build:
-    privileged: true
-    image: rancher/dapper:1.11.2
-    volumes:
-    - /var/run/docker.sock:/var/run/docker.sock
-    commands:
-    - dapper ci
+kind: pipeline
+name: default-amd64
 
-  github-binary-publish-release:
-    image: plugins/github-release
-    files:
-     - bin/kontainer-engine-driver-tencent-*
-    checksum:
-     - sha256
-    secrets: [github_token]
-    when:
-      branch: master
-      event: tag
-      ref:
-        exclude: [ refs/tags/*rc* ]
+platform:
+  os: linux
+  arch: amd64
 
-  github-binary-publish-prerelease:
-    image: plugins/github-release
+steps:
+- name: build
+  pull: default
+  image: rancher/dapper:v0.4.1
+  commands:
+  - dapper ci
+  privileged: true
+  volumes:
+  - name: docker
+    path: /var/run/docker.sock
+  when:
+    event:
+    - push
+    - pull_request
+    - tag
+
+- name: github_binary_release
+  image: plugins/github-release
+  settings:
+    api_key:
+      from_secret: github_token
     prerelease: true
-    files:
-     - bin/kontainer-engine-driver-tencent-*
     checksum:
-     - sha256
-    secrets: [github_token]
-    when:
-      branch: master
-      event: tag
-      ref:
-        include: [ refs/tags/*rc* ]
+    - sha256
+    checksum_file: CHECKSUMsum-amd64.txt
+    checksum_flatten: true
+    files:
+    - "dist/artifacts/*"
+  when:
+    ref:
+    - refs/head/master
+    - refs/tags/*
+    event:
+    - tag
+
+volumes:
+- name: docker
+  host:
+    path: /var/run/docker.sock
+
+node:
+  instance: agent-amd64
+
+trigger:
+  event:
+    exclude:
+    - promote
+...
