@@ -13,7 +13,7 @@ This repo contains the TKE(Tencent Kubernetes Engine) driver for the rancher ser
 `./bin/kontainer-engine-driver-tencent`
 
 ## License
-Copyright (c) 2018 [Rancher Labs, Inc.](http://rancher.com)
+Copyright (c) 2020 [Rancher Labs, Inc.](http://rancher.com)
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
