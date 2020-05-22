@@ -7,15 +7,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rancher/kontainer-engine-driver-tencent/tencentcloud/ccs"
 	"github.com/rancher/kontainer-engine/drivers/options"
 	"github.com/rancher/kontainer-engine/drivers/util"
 	"github.com/rancher/kontainer-engine/types"
 	"github.com/rancher/rke/log"
 	"github.com/sirupsen/logrus"
 	tccommon "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
-	tcerrors "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/errors"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
+	cvm "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/cvm/v20170312"
+	tke "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/tke/v20180525"
 	"golang.org/x/net/context"
 
 	"k8s.io/client-go/kubernetes"
@@ -23,13 +23,17 @@ import (
 )
 
 const (
-	runningStatus        = "Running"
-	successStatus        = "Success"
-	failedStatus         = "Failed"
-	notReadyStatus       = "ClusterNotReadyError"
-	processRunningStatus = "ProcessAlreadyRunning"
-	retries              = 5
-	pollInterval         = 30
+	runningStatus  = "Running"
+	successStatus  = "Created"
+	failedStatus   = "CreateFailed"
+	notReadyStatus = "ClusterNotReadyError"
+	retries        = 5
+	pollInterval   = 30
+)
+
+var (
+	instanceDeleteModeTerminate = "terminate"
+	managedClusterType          = "MANAGED_CLUSTER"
 )
 
 // Driver defines the struct of tke driver
@@ -65,6 +69,8 @@ type state struct {
 
 	// The zone id of the cluster
 	ZoneID string
+	// The image id of the node
+	ImageID string
 	// The number of nodes purchased, up to 100
 	GoodsNum int64
 	// CPU core number
@@ -200,6 +206,11 @@ func (d *Driver) GetDriverCreateOptions(ctx context.Context) (*types.DriverFlags
 		Type:  types.StringType,
 		Usage: "The zone id of the cluster",
 	}
+	driverFlag.Options["imageId"] = &types.Flag{
+		Type:    types.StringType,
+		Usage:   "The image id of the node,  default value img-pi0ii46r (ubuntu Server 18.04.1 LTS 64)",
+		Default: &types.Default{DefaultString: "img-pi0ii46r"},
+	}
 	driverFlag.Options["node-count"] = &types.Flag{
 		Type:  types.IntType,
 		Usage: "The node count of the cluster, up to 100",
@@ -224,8 +235,8 @@ func (d *Driver) GetDriverCreateOptions(ctx context.Context) (*types.DriverFlags
 	}
 	driverFlag.Options["cvm-type"] = &types.Flag{
 		Type:    types.StringType,
-		Usage:   "The cvm type of node, default to PayByHour",
-		Default: &types.Default{DefaultString: "PayByHour"},
+		Usage:   "The cvm type of node, default to POSTPAID_BY_HOUR",
+		Default: &types.Default{DefaultString: "POSTPAID_BY_HOUR"},
 	}
 	driverFlag.Options["renew-flag"] = &types.Flag{
 		Type:  types.StringType,
@@ -234,7 +245,7 @@ func (d *Driver) GetDriverCreateOptions(ctx context.Context) (*types.DriverFlags
 	driverFlag.Options["bandwidth-type"] = &types.Flag{
 		Type:    types.StringType,
 		Usage:   "Type of bandwidth",
-		Default: &types.Default{DefaultString: "PayByHour"},
+		Default: &types.Default{DefaultString: "TRAFFIC_POSTPAID_BY_HOUR"},
 	}
 	driverFlag.Options["bandwidth"] = &types.Flag{
 		Type:    types.IntType,
@@ -386,6 +397,7 @@ func getStateFromOpts(driverOptions *types.DriverOptions, isCreate bool) (*state
 	d.ProjectID = options.GetValueFromDriverOptions(driverOptions, types.IntType, "project-id", "projectId").(int64)
 
 	d.ZoneID = options.GetValueFromDriverOptions(driverOptions, types.StringType, "zone-id", "zoneId").(string)
+	d.ImageID = options.GetValueFromDriverOptions(driverOptions, types.StringType, "image-id", "imageId").(string)
 	d.CPU = options.GetValueFromDriverOptions(driverOptions, types.IntType, "cpu").(int64)
 	d.Mem = options.GetValueFromDriverOptions(driverOptions, types.IntType, "mem").(int64)
 	d.OsName = options.GetValueFromDriverOptions(driverOptions, types.StringType, "os-name", "osName").(string)
@@ -444,15 +456,29 @@ func (s *state) validate(isCreate bool) error {
 	return nil
 }
 
-func getTKEServiceClient(state *state, method string) (*ccs.Client, error) {
+func getTKEServiceClient(state *state, method string) (*tke.Client, error) {
 	credential := tccommon.NewCredential(state.SecretID, state.SecretKey)
 	cpf := profile.NewClientProfile()
-	cpf.HttpProfile.Endpoint = "ccs.api.qcloud.com/v2/index.php"
 	cpf.HttpProfile.ReqTimeout = 20
 	cpf.SignMethod = "HmacSHA1"
 	cpf.HttpProfile.ReqMethod = method
 
-	client, err := ccs.NewClient(credential, state.Region, cpf)
+	client, err := tke.NewClient(credential, state.Region, cpf)
+	if err != nil {
+		return nil, err
+	}
+
+	return client, nil
+}
+
+func getCVMServiceClient(state *state, method string) (*cvm.Client, error) {
+	credential := tccommon.NewCredential(state.SecretID, state.SecretKey)
+	cpf := profile.NewClientProfile()
+	cpf.HttpProfile.ReqTimeout = 20
+	cpf.SignMethod = "HmacSHA1"
+	cpf.HttpProfile.ReqMethod = method
+
+	client, err := cvm.NewClient(credential, state.Region, cpf)
 	if err != nil {
 		return nil, err
 	}
@@ -482,15 +508,13 @@ func (d *Driver) Create(ctx context.Context, opts *types.DriverOptions, _ *types
 	defer storeState(info, state)
 
 	// init tke client and make create cluster api request
-	resp, err := svc.CreateCluster(req, state.EmptyCluster)
-	if _, ok := err.(*tcerrors.TencentCloudSDKError); ok {
+	resp, err := svc.CreateCluster(req)
+	if err != nil {
 		return info, err
 	}
 
-	if err == nil {
-		state.ClusterID = resp.Data.ClusterID
-		logrus.Debugf("Cluster %s create is called for region %s and zone %s. Status Code %v", state.ClusterID, state.Region, state.ZoneID, resp.Code)
-	}
+	state.ClusterID = *resp.Response.ClusterId
+	logrus.Debugf("Cluster %s create is called for region %s and zone %s.", state.ClusterID, state.Region, state.ZoneID)
 
 	if err := waitTKECluster(ctx, svc, state); err != nil {
 		return info, err
@@ -499,22 +523,96 @@ func (d *Driver) Create(ctx context.Context, opts *types.DriverOptions, _ *types
 	return info, nil
 }
 
-func (d *Driver) getWrapCreateClusterRequest(state *state) (*ccs.CreateClusterRequest, error) {
+func (d *Driver) getWrapCreateClusterRequest(state *state) (*tke.CreateClusterRequest, error) {
 	logrus.Info("invoking createCluster")
 	state.GoodsNum = state.NodeCount
-	request := ccs.NewCreateClusterRequest(state.EmptyCluster)
-	content, err := json.Marshal(state)
+
+	stringRunInstancesPara, err := getRunInstancesPara(state)
 	if err != nil {
 		return nil, err
 	}
-	err = request.FromJSONString(string(content))
-	if err != nil {
-		return nil, err
+
+	request := tke.NewCreateClusterRequest()
+
+	request.ClusterCIDRSettings = &tke.ClusterCIDRSettings{
+		ClusterCIDR:               tccommon.StringPtr(state.ClusterCIDR),
+		IgnoreClusterCIDRConflict: tccommon.BoolPtr(getBoolean(state.IgnoreClusterCIDRConflict)),
 	}
+	request.ClusterType = tccommon.StringPtr(managedClusterType)
+
+	request.RunInstancesForNode = []*tke.RunInstancesForNode{
+		{
+			NodeRole: tccommon.StringPtr("WORKER"),
+			RunInstancesPara: []*string{
+				tccommon.StringPtr(stringRunInstancesPara),
+			},
+		},
+	}
+
+	request.ClusterBasicSettings = &tke.ClusterBasicSettings{
+		ClusterOs:          tccommon.StringPtr(state.OsName),
+		ClusterVersion:     tccommon.StringPtr(state.ClusterVersion),
+		ClusterName:        tccommon.StringPtr(state.ClusterName),
+		ClusterDescription: tccommon.StringPtr(state.ClusterDesc),
+		VpcId:              tccommon.StringPtr(state.VpcID),
+		ProjectId:          tccommon.Int64Ptr(state.ProjectID),
+	}
+
 	return request, nil
 }
 
-func waitTKECluster(ctx context.Context, svc *ccs.Client, state *state) error {
+func getRunInstancesPara(state *state) (string, error) {
+	zone, err := getZone(state)
+	if err != nil {
+		return "", err
+	}
+
+	runInstancesPara := cvm.NewRunInstancesRequest()
+	runInstancesPara.ImageId = tccommon.StringPtr(state.ImageID)
+	runInstancesPara.Placement = &cvm.Placement{
+		Zone: tccommon.StringPtr(zone),
+	}
+	runInstancesPara.InstanceChargeType = tccommon.StringPtr(getInstanceChargeType(state.CvmType))
+	runInstancesPara.InstanceCount = tccommon.Int64Ptr(state.GoodsNum)
+	runInstancesPara.InstanceType = tccommon.StringPtr(state.InstanceType)
+	runInstancesPara.InternetAccessible = &cvm.InternetAccessible{
+		InternetChargeType:      tccommon.StringPtr(getInternetChargeType(state.BandwidthType)),
+		InternetMaxBandwidthOut: tccommon.Int64Ptr(state.Bandwidth),
+		PublicIpAssigned:        tccommon.BoolPtr(getBoolean(state.WanIP)),
+	}
+
+	runInstancesPara.VirtualPrivateCloud = &cvm.VirtualPrivateCloud{
+		SubnetId:     tccommon.StringPtr(state.SubnetID),
+		VpcId:        tccommon.StringPtr(state.VpcID),
+		AsVpcGateway: tccommon.BoolPtr(getBoolean(state.IsVpcGateway)),
+	}
+
+	runInstancesPara.SystemDisk = &cvm.SystemDisk{
+		DiskType: tccommon.StringPtr(state.RootType),
+		DiskSize: tccommon.Int64Ptr(state.RootSize),
+	}
+
+	runInstancesPara.DataDisks = []*cvm.DataDisk{
+		{
+			DiskType: tccommon.StringPtr(state.StorageType),
+			DiskSize: tccommon.Int64Ptr(state.StorageSize),
+		},
+	}
+
+	runInstancesPara.LoginSettings = &cvm.LoginSettings{
+		KeyIds: []*string{
+			tccommon.StringPtr(state.KeyID),
+		},
+	}
+	runInstancesPara.SecurityGroupIds = []*string{
+		tccommon.StringPtr(state.SgID),
+	}
+	stringRunInstancesPara := runInstancesPara.ToJsonString()
+
+	return stringRunInstancesPara, nil
+}
+
+func waitTKECluster(ctx context.Context, svc *tke.Client, state *state) error {
 	lastMsg := ""
 	timeout := time.Duration(30 * time.Minute)
 	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -534,50 +632,45 @@ func waitTKECluster(ctx context.Context, svc *ccs.Client, state *state) error {
 				return err
 			}
 
-			if cluster.CodeDesc != lastMsg {
-				log.Infof(ctx, "provisioning cluster %s: %s", state.ClusterName, cluster.CodeDesc)
-				lastMsg = cluster.CodeDesc
+			if *cluster.Response.Clusters[0].ClusterStatus != lastMsg {
+				log.Infof(ctx, "provisioning cluster %s: %s", state.ClusterName, *cluster.Response.Clusters[0].ClusterStatus)
+				lastMsg = *cluster.Response.Clusters[0].ClusterStatus
 			}
 
-			if cluster.Data.Clusters[0].Status == runningStatus {
+			if *cluster.Response.Clusters[0].ClusterStatus == runningStatus {
 				log.Infof(ctx, "cluster %v is running", state.ClusterName)
 				return nil
-			} else if cluster.Data.Clusters[0].Status == failedStatus {
-				return fmt.Errorf("tencent cloud failed to provision cluster: %s", cluster.Message)
+			} else if *cluster.Response.Clusters[0].ClusterStatus == failedStatus {
+				return fmt.Errorf("tencent cloud failed to provision cluster")
 			}
 		}
 	}
 }
 
-func getCluster(svc *ccs.Client, state *state) (*ccs.DescribeClusterResponse, error) {
+func getCluster(svc *tke.Client, state *state) (*tke.DescribeClustersResponse, error) {
 	logrus.Infof("invoking getCluster")
 	req, err := getWrapDescribeClusterRequest(state)
 	if err != nil {
 		return nil, err
 	}
 
-	resp, err := svc.DescribeCluster(req)
-	if _, ok := err.(*tcerrors.TencentCloudSDKError); ok {
+	resp, err := svc.DescribeClusters(req)
+	if err != nil {
 		return resp, fmt.Errorf("an API error has returned: %s", err)
 	}
 
-	if resp.Data.TotalCount <= 0 {
+	if *resp.Response.TotalCount <= 0 {
 		return nil, fmt.Errorf("cluster %s is not found", state.ClusterName)
 	}
 	return resp, nil
 }
 
-func getWrapDescribeClusterRequest(state *state) (*ccs.DescribeClusterRequest, error) {
+func getWrapDescribeClusterRequest(state *state) (*tke.DescribeClustersRequest, error) {
 	logrus.Info("invoking describeCluster")
-	request := ccs.NewDescribeClusterRequest()
-	request.Limit = 20
-	content, err := json.Marshal(state)
-	if err != nil {
-		return nil, err
-	}
-	err = request.FromJSONString(string(content))
-	if err != nil {
-		return nil, err
+	request := tke.NewDescribeClustersRequest()
+	request.Limit = tccommon.Int64Ptr(int64(20))
+	request.ClusterIds = []*string{
+		tccommon.StringPtr(state.ClusterID),
 	}
 	return request, nil
 }
@@ -624,35 +717,40 @@ func (d *Driver) Update(ctx context.Context, info *types.ClusterInfo, opts *type
 	logrus.Debugf("Updating config, clusterName: %s, clusterVersion: %s, new node: %v", state.ClusterName, state.ClusterVersion, newState.GoodsNum)
 
 	if state.NodeCount != newState.NodeCount {
-		request := ccs.NewDescribeClusterInstancesRequest()
-		request.ClusterID = state.ClusterID
-		resp, err := svc.DescribeClusterInstance(request)
-		if _, ok := err.(*tcerrors.TencentCloudSDKError); ok {
+		request := tke.NewDescribeClusterInstancesRequest()
+		request.ClusterId = &state.ClusterID
+		resp, err := svc.DescribeClusterInstances(request)
+		if err != nil {
 			return nil, fmt.Errorf("an API error has returned: %s", err)
 		}
-		nodeCount := resp.Data.TotalCount
+		nodeCount := resp.Response.TotalCount
 
-		if newState.NodeCount > nodeCount {
+		if newState.NodeCount > int64(*nodeCount) {
 
 			log.Infof(ctx, "Scaling up cluster nodes to %d", newState.NodeCount)
-			req, err := getWrapAddClusterInstancesRequest(state, newState, nodeCount)
+			req, err := getWrapAddClusterInstancesRequest(state, newState, int64(*nodeCount))
 			if err != nil {
 				return nil, err
 			}
 
-			resp, err := svc.AddClusterInstances(req)
-			if _, ok := err.(*tcerrors.TencentCloudSDKError); ok {
+			if _, err = svc.CreateClusterInstances(req); err != nil {
 				return nil, err
 			}
-			if err == nil {
-				logrus.Infof("Add cluster instances is called for cluster %s. Status Code %v, Response Instance IDs: %s", state.ClusterID, resp.Code, resp.Data.InstanceIDs)
-			}
+
+			logrus.Infof("Add cluster instances is called for cluster %s.", state.ClusterID)
+
 			if err := waitTKECluster(ctx, svc, state); err != nil {
 				return nil, err
 			}
-		} else if newState.NodeCount < resp.Data.TotalCount {
+		} else if newState.NodeCount < int64(*nodeCount) {
 			log.Infof(ctx, "Scaling down cluster nodes to %d", newState.NodeCount)
-			if err := removeClusterInstances(state, newState, svc, resp); err != nil {
+
+			req, err := removeClusterInstances(state, newState, resp)
+			if err != nil {
+				return nil, err
+			}
+
+			if _, err = svc.DeleteClusterInstances(req); err != nil {
 				return nil, err
 			}
 		}
@@ -667,13 +765,12 @@ func (d *Driver) Update(ctx context.Context, info *types.ClusterInfo, opts *type
 		}
 
 		// init the TKE client
-		resp, err := svc.ModifyClusterAttributes(req)
-		if _, ok := err.(*tcerrors.TencentCloudSDKError); ok {
+		if _, err = svc.ModifyClusterAttribute(req); err != nil {
 			return nil, err
 		}
-		if err == nil {
-			logrus.Infof("Modify cluster attributes is called for cluster %s. Status Code %v", state.ClusterID, resp.Code)
-		}
+
+		logrus.Infof("Modify cluster attributes is called for cluster %s.", state.ClusterID)
+
 		if err := waitTKECluster(ctx, svc, state); err != nil {
 			return nil, err
 		}
@@ -689,13 +786,12 @@ func (d *Driver) Update(ctx context.Context, info *types.ClusterInfo, opts *type
 		}
 
 		// init the TKE client
-		resp, err := svc.ModifyProjectID(req)
-		if _, ok := err.(*tcerrors.TencentCloudSDKError); ok {
+		if _, err = svc.ModifyClusterAttribute(req); err != nil {
 			return nil, err
 		}
-		if err == nil {
-			logrus.Infof("Modify cluster projectId is called for cluster %s. Status Code %v", state.ClusterID, resp.Code)
-		}
+
+		logrus.Infof("Modify cluster projectId is called for cluster %s.", state.ClusterID)
+
 		if err := waitTKECluster(ctx, svc, state); err != nil {
 			return nil, err
 		}
@@ -704,47 +800,38 @@ func (d *Driver) Update(ctx context.Context, info *types.ClusterInfo, opts *type
 	return info, storeState(info, state)
 }
 
-func removeClusterInstances(state, newState *state, svc *ccs.Client, instancesResp *ccs.DescribeClusterInstancesResponse) error {
-	deleteCount := state.NodeCount - newState.NodeCount
+func removeClusterInstances(state, newState *state, instancesResp *tke.DescribeClusterInstancesResponse) (*tke.DeleteClusterInstancesRequest, error) {
+	deleteCount := int64(*instancesResp.Response.TotalCount) - newState.NodeCount
 	logrus.Debugf("invoking removeClusterInstances, delete node count: %d", deleteCount)
 
-	if instancesResp.Data.TotalCount < deleteCount {
-		return fmt.Errorf("total count of current cluster nodes is %d, fail to remove requested value of %d",
-			instancesResp.Data.TotalCount, deleteCount)
-	}
-
-	var instanceIds = make([]string, deleteCount)
-	deleteNodes := instancesResp.Data.Nodes[:deleteCount]
+	var instanceIds = make([]*string, deleteCount)
+	deleteNodes := instancesResp.Response.InstanceSet[:deleteCount]
 	for i, node := range deleteNodes {
-		instanceIds[i] = node.InstanceID
+		instanceIds[i] = node.InstanceId
 	}
 
-	req := ccs.NewDeleteClusterInstancesRequest()
-	req.ClusterID = state.ClusterID
-	req.InstanceIDs = instanceIds
-	rep, err := svc.DeleteClusterInstances(req)
-	if _, ok := err.(*tcerrors.TencentCloudSDKError); ok {
-		return fmt.Errorf("an API error has returned: %s", err)
-	}
-	logrus.Infof("success delete total %d nodes, resp:%v", deleteCount, rep.CodeDesc)
-	return nil
+	request := tke.NewDeleteClusterInstancesRequest()
+	request.ClusterId = &state.ClusterID
+	request.InstanceIds = instanceIds
+	request.InstanceDeleteMode = &instanceDeleteModeTerminate
+
+	return request, nil
 }
-
-func getClusterCerts(svc *ccs.Client, state *state) (*ccs.DescribeClusterSecurityInfoResponse, error) {
+func getClusterCerts(svc *tke.Client, state *state) (*tke.DescribeClusterSecurityResponse, error) {
 	logrus.Info("invoking getClusterCerts")
 
-	request := ccs.NewDescribeClusterSecurityInfoRequest()
+	request := tke.NewDescribeClusterSecurityRequest()
 	content, err := json.Marshal(state)
 	if err != nil {
 		return nil, err
 	}
-	err = request.FromJSONString(string(content))
-	if err != nil {
+
+	if err = request.FromJsonString(string(content)); err != nil {
 		return nil, err
 	}
 
-	resp, err := svc.DescribeClusterSecurityInfo(request)
-	if _, ok := err.(*tcerrors.TencentCloudSDKError); ok {
+	resp, err := svc.DescribeClusterSecurity(request)
+	if err != nil {
 		return resp, fmt.Errorf("an API error has returned: %s", err)
 	}
 	return resp, nil
@@ -804,26 +891,29 @@ func (d *Driver) Remove(ctx context.Context, info *types.ClusterInfo) error {
 	if err != nil {
 		return err
 	}
-	resp, err := svc.DeleteCluster(req)
+
+	req.InstanceDeleteMode = &instanceDeleteModeTerminate
+
+	_, err = svc.DeleteCluster(req)
 	if err != nil && !strings.Contains(err.Error(), "NotFound") {
 		return err
 	} else if err == nil {
-		logrus.Debugf("Cluster %v delete is called. Status Code %v", state.ClusterName, resp.Code)
+		logrus.Debugf("Cluster %v delete is called.", state.ClusterName)
 	} else {
 		logrus.Debugf("Cluster %s doesn't exist", state.ClusterName)
 	}
 	return nil
 }
 
-func (d *Driver) getWrapRemoveClusterRequest(state *state) (*ccs.DeleteClusterRequest, error) {
+func (d *Driver) getWrapRemoveClusterRequest(state *state) (*tke.DeleteClusterRequest, error) {
 	logrus.Info("invoking get remove cluster request")
-	request := ccs.NewDeleteClusterRequest()
+	request := tke.NewDeleteClusterRequest()
 	content, err := json.Marshal(state)
 	if err != nil {
 		return nil, err
 	}
-	err = request.FromJSONString(string(content))
-	if err != nil {
+
+	if err = request.FromJsonString(string(content)); err != nil {
 		return nil, err
 	}
 	return request, nil
@@ -848,7 +938,7 @@ func (d *Driver) GetClusterSize(ctx context.Context, info *types.ClusterInfo) (*
 	if err != nil {
 		return nil, err
 	}
-	return &types.NodeCount{Count: clusters.Data.Clusters[0].NodeNum}, nil
+	return &types.NodeCount{Count: int64(*clusters.Response.Clusters[0].ClusterNodeNum)}, nil
 }
 
 // GetVersion implements driver get cluster kubernetes version interface
@@ -865,32 +955,36 @@ func (d *Driver) GetVersion(ctx context.Context, info *types.ClusterInfo) (*type
 	if err != nil {
 		return nil, err
 	}
-	return &types.KubernetesVersion{Version: resp.Data.Clusters[0].K8sVersion}, nil
+	return &types.KubernetesVersion{Version: *resp.Response.Clusters[0].ClusterVersion}, nil
 }
 
 // operateClusterVip creates or remove the cluster vip
-func operateClusterVip(ctx context.Context, svc *ccs.Client, clusterID, operation string) error {
+func operateClusterVip(ctx context.Context, svc *tke.Client, clusterID, operation string) error {
 	logrus.Info("invoking operateClusterVip")
 
-	req := ccs.NewOperateClusterVipRequest()
-	req.ClusterID = clusterID
-	req.Operation = operation
+	req := tke.NewCreateClusterEndpointVipRequest()
+	req.ClusterId = &clusterID
+
+	reqStatus := tke.NewDescribeClusterEndpointVipStatusRequest()
+	reqStatus.ClusterId = &clusterID
+
+	if _, err := svc.CreateClusterEndpointVip(req); err != nil {
+		return fmt.Errorf("an API error has returned: %s", err)
+	}
 
 	count := 0
 	for {
-		resp, err := svc.OperateClusterVip(req)
-
-		if _, ok := err.(*tcerrors.TencentCloudSDKError); ok {
-			if !strings.Contains(err.Error(), processRunningStatus) {
-				return fmt.Errorf("an API error has returned: %s", err)
-			}
+		respStatus, err := svc.DescribeClusterEndpointVipStatus(reqStatus)
+		if err != nil {
+			return fmt.Errorf("an API error has returned: %s", err)
 		}
 
-		if resp.CodeDesc == successStatus && count >= 1 {
+		if *respStatus.Response.Status == successStatus && count >= 1 {
 			return nil
+		} else if *respStatus.Response.Status == failedStatus {
+			return fmt.Errorf("describe cluster endpoint vip status: %s", err)
 		}
 		count++
-		log.Infof(ctx, "operating cluster vip: %s", resp.CodeDesc)
 		time.Sleep(time.Second * 15)
 	}
 }
@@ -942,7 +1036,7 @@ func getClientSet(ctx context.Context, info *types.ClusterInfo) (kubernetes.Inte
 		return nil, err
 	}
 
-	if certs.Data.ClusterExternalEndpoint == "" {
+	if *certs.Response.ClusterExternalEndpoint == "" {
 		err := operateClusterVip(ctx, svc, state.ClusterID, "Create")
 		if err != nil {
 			return nil, err
@@ -955,13 +1049,13 @@ func getClientSet(ctx context.Context, info *types.ClusterInfo) (kubernetes.Inte
 		}
 	}
 
-	info.Version = cluster.Data.Clusters[0].K8sVersion
-	info.Endpoint = certs.Data.ClusterExternalEndpoint
-	info.RootCaCertificate = base64.StdEncoding.EncodeToString([]byte(certs.Data.CertificationAuthority))
-	info.Username = certs.Data.UserName
-	info.Password = certs.Data.Password
-	info.NodeCount = cluster.Data.Clusters[0].NodeNum
-	info.Status = cluster.Data.Clusters[0].Status
+	info.Version = *cluster.Response.Clusters[0].ClusterVersion
+	info.Endpoint = *certs.Response.ClusterExternalEndpoint
+	info.RootCaCertificate = base64.StdEncoding.EncodeToString([]byte(*certs.Response.CertificationAuthority))
+	info.Username = *certs.Response.UserName
+	info.Password = *certs.Response.Password
+	info.NodeCount = int64(*cluster.Response.Clusters[0].ClusterNodeNum)
+	info.Status = *cluster.Response.Clusters[0].ClusterStatus
 
 	host := info.Endpoint
 	if !strings.HasPrefix(host, "https://") {
@@ -970,10 +1064,10 @@ func getClientSet(ctx context.Context, info *types.ClusterInfo) (kubernetes.Inte
 
 	config := &rest.Config{
 		Host:     host,
-		Username: certs.Data.UserName,
-		Password: certs.Data.Password,
+		Username: *certs.Response.UserName,
+		Password: *certs.Response.Password,
 		TLSClientConfig: rest.TLSClientConfig{
-			CAData: []byte(certs.Data.CertificationAuthority),
+			CAData: []byte(*certs.Response.CertificationAuthority),
 		},
 	}
 	clientSet, err := kubernetes.NewForConfig(config)
@@ -1013,7 +1107,7 @@ func (d *Driver) GetK8SCapabilities(ctx context.Context, opts *types.DriverOptio
 	return capabilities, nil
 }
 
-func getWrapAddClusterInstancesRequest(state, newState *state, nodeCount int64) (*ccs.AddClusterInstancesRequest, error) {
+func getWrapAddClusterInstancesRequest(state, newState *state, nodeCount int64) (*tke.CreateClusterInstancesRequest, error) {
 	logrus.Debugf("invoking get wrap request of AddClusterInstances")
 	// goodsNum is the new nodes count that will be added to the cluster
 	state.GoodsNum = newState.NodeCount - nodeCount
@@ -1045,19 +1139,21 @@ func getWrapAddClusterInstancesRequest(state, newState *state, nodeCount int64) 
 	if newState.SecretKey != "" {
 		state.SecretKey = newState.SecretKey
 	}
-	content, err := json.Marshal(state)
+
+	request := tke.NewCreateClusterInstancesRequest()
+
+	stringRunInstancesPara, err := getRunInstancesPara(state)
 	if err != nil {
 		return nil, err
 	}
-	request := ccs.NewAddClusterInstancesRequest()
-	err = request.FromJSONString(string(content))
-	if err != nil {
-		return nil, err
-	}
+
+	request.ClusterId = &state.ClusterID
+	request.RunInstancePara = &stringRunInstancesPara
+
 	return request, nil
 }
 
-func getWrapModifyClusterAttributesRequest(state, newState *state) (*ccs.ModifyClusterAttributesRequest, error) {
+func getWrapModifyClusterAttributesRequest(state, newState *state) (*tke.ModifyClusterAttributeRequest, error) {
 	logrus.Debugf("invoking get wrap request of ModifyClusterAttributes")
 	if newState.ClusterName != "" {
 		state.ClusterName = newState.ClusterName
@@ -1071,20 +1167,16 @@ func getWrapModifyClusterAttributesRequest(state, newState *state) (*ccs.ModifyC
 	if newState.SecretKey != "" {
 		state.SecretKey = newState.SecretKey
 	}
-	content, err := json.Marshal(state)
-	if err != nil {
-		return nil, err
-	}
 
-	request := ccs.NewModifyClusterAttributesRequest()
-	err = request.FromJSONString(string(content))
-	if err != nil {
-		return nil, err
-	}
+	request := tke.NewModifyClusterAttributeRequest()
+	request.ClusterId = &state.ClusterID
+	request.ClusterName = &state.ClusterName
+	request.ClusterDesc = &state.ClusterDesc
+
 	return request, nil
 }
 
-func getWrapModifyProjectIDRequest(state, newState *state) (*ccs.ModifyProjectIDRequest, error) {
+func getWrapModifyProjectIDRequest(state, newState *state) (*tke.ModifyClusterAttributeRequest, error) {
 	logrus.Debugf("invoking get wrap request of ModifyProjectId")
 	if state.ProjectID != newState.ProjectID {
 		state.ProjectID = newState.ProjectID
@@ -1095,14 +1187,62 @@ func getWrapModifyProjectIDRequest(state, newState *state) (*ccs.ModifyProjectID
 	if newState.SecretKey != "" {
 		state.SecretKey = newState.SecretKey
 	}
-	content, err := json.Marshal(state)
-	if err != nil {
-		return nil, err
-	}
-	request := ccs.NewModifyProjectIDRequest()
-	err = request.FromJSONString(string(content))
-	if err != nil {
-		return nil, err
-	}
+
+	request := tke.NewModifyClusterAttributeRequest()
+	request.ClusterId = &state.ClusterID
+	request.ProjectId = &state.ProjectID
+
 	return request, nil
+}
+
+func getBoolean(value int64) bool {
+	return value == 1
+}
+
+func getInstanceChargeType(value string) string {
+	instanceChargeType := value
+	switch value {
+	case "PayByHour":
+		instanceChargeType = "POSTPAID_BY_HOUR"
+	case "PayByMonth":
+		instanceChargeType = "PREPAID"
+	default:
+		instanceChargeType = "POSTPAID_BY_HOUR"
+	}
+
+	return instanceChargeType
+}
+
+func getInternetChargeType(value string) string {
+	internetChargeType := value
+	switch value {
+	case "PayByHour":
+		internetChargeType = "BANDWIDTH_POSTPAID_BY_HOUR"
+	case "PayByTraffic":
+		internetChargeType = "TRAFFIC_POSTPAID_BY_HOUR"
+	}
+
+	return internetChargeType
+}
+
+func getZone(state *state) (string, error) {
+	zone := state.ZoneID
+	svc, err := getCVMServiceClient(state, "GET")
+	if err != nil {
+		return zone, err
+	}
+
+	request := cvm.NewDescribeZonesRequest()
+	response, err := svc.DescribeZones(request)
+	if err != nil {
+		return zone, err
+	}
+
+	for _, item := range response.Response.ZoneSet {
+		if *item.ZoneId == state.ZoneID {
+			zone = *item.Zone
+		}
+	}
+
+	return zone, nil
 }
