@@ -61,16 +61,21 @@ func main() {
         cpf := profile.NewClientProfile()
         // SDK默认使用POST方法。
         // 如果你一定要使用GET方法，可以在这里设置。GET方法无法处理一些较大的请求。
-        cpf.HttpProfile.ReqMethod = "GET"
-        // SDK有默认的超时时间，非必要请不要进行调整。
+        // 如非必要请不要修改默认设置。
+        //cpf.HttpProfile.ReqMethod = "GET"
+        // SDK有默认的超时时间，如非必要请不要修改默认设置。
         // 如有需要请在代码中查阅以获取最新的默认值。
-        cpf.HttpProfile.ReqTimeout = 10
+        //cpf.HttpProfile.ReqTimeout = 10
         // SDK会自动指定域名。通常是不需要特地指定域名的，但是如果你访问的是金融区的服务，
         // 则必须手动指定域名，例如云服务器的上海金融区域名： cvm.ap-shanghai-fsi.tencentcloudapi.com
-        cpf.HttpProfile.Endpoint = "cvm.tencentcloudapi.com"
+        //cpf.HttpProfile.Endpoint = "cvm.tencentcloudapi.com"
         // SDK默认用HmacSHA256进行签名，它更安全但是会轻微降低性能。
-        // 非必要请不要修改这个字段。
-        cpf.SignMethod = "HmacSHA1"
+        // 如非必要请不要修改默认设置。
+        //cpf.SignMethod = "HmacSHA1"
+        // SDK 默认用 zh-CN 调用返回中文。此外还可以设置 en-US 返回全英文。
+        // 但大部分产品或接口并不支持全英文的返回。
+        // 如非必要请不要修改默认设置。
+        //cpf.Language = "en-US"
 
         // 实例化要请求产品(以cvm为例)的client对象
         // 第二个参数是地域信息，可以直接填写字符串ap-guangzhou，或者引用预设的常量
@@ -125,25 +130,154 @@ func main() {
 
 更多示例参见 [examples](https://github.com/TencentCloud/tencentcloud-sdk-go/tree/master/examples) 目录。对于复杂接口的 Request 初始化例子，可以参考 examples/cvm/v20170312/run_instances.go 。对于使用json字符串初始化 Request 的例子，可以参考 examples/cvm/v20170312/describe_instances.go 。
 
+# 相关配置
+
+## 代理
+
+如果是有代理的环境下，需要设置系统环境变量 `https_proxy` ，否则可能无法正常调用，抛出连接超时的异常。
+
+## 开启 DNS 缓存
+
+当前 GO SDK 总是会去请求 DNS 服务器，而没有使用到 nscd 的缓存，可以通过导出环境变量`GODEBUG=netdns=cgo`，或者`go build`编译时指定参数`-tags 'netcgo'`控制读取 nscd 缓存。
+
+## 忽略服务器证书校验
+
+虽然使用 SDK 调用公有云服务时，必须校验服务器证书，以识破他人伪装的服务器，确保请求的安全。
+但是某些极端情况下，例如测试时，你可能会需要忽略自签名的服务器证书。
+以下是其中一种可能的方法：
+
+```
+import "crypto/tls"
+...
+    client, _ := cvm.NewClient(credential, regions.Guangzhou, cpf)
+    tr := &http.Transport{
+        TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+    }
+    client.WithHttpTransport(tr)
+...
+```
+
+再次强调，除非你知道自己在做什么，并明白由此带来的风险，否则不要尝试关闭服务器证书校验。
+
 # 支持产品列表
 
-| 产品中文名 | 对应模块 |
+| 包名 | 产品中文名 |
 |------------|------|
-| 云服务器 | cvm |
-| 云硬盘 | cbs |
-| 无服务器云函数 | scf |
-| 容器实例服务 | cis |
-| 私有网络 | vpc |
-| 批量计算 | batch |
-| 数据库 MySQL | cdb |
-| 数据库 MariaDB(TDSQL) | mariadb |
-| 数据库 PostgreSQL | postgres |
-| 分布式数据库 DCDB | dcdb |
-| 数据传输服务 DTS | dts |
-| Web 漏洞扫描 | cws |
-| 应用安全 | ms |
-| 加速物联网套件 | iot |
-| 智能语音服务 | aai |
-| 腾讯机器翻译 | tmt |
-| 电子合同服务 | ds |
-| 渠道合作伙伴 | partners |
+| aai | 智能语音服务，不推荐 |
+| ame | 正版曲库直通车 |
+| as | 弹性伸缩 |
+| asr | 语音识别 |
+| batch | 批量计算 |
+| billing | 计费相关 |
+| bizlive | 小程序·云直播 |
+| bm | 黑石物理服务器 |
+| bmeip | 黑石弹性公网IP |
+| bmlb | 黑石负载均衡 |
+| bmvpc | 黑石私有网络 |
+| bri | 业务风险情报 |
+| cam | 访问管理 |
+| captcha | 验证码 |
+| cat | 云拨测 |
+| cbs | 云硬盘 |
+| cdb | 云数据库 MySQL |
+| cdn | 内容分发网络 |
+| cds | 数盾 |
+| cfs | 文件存储 |
+| chdfs | 云 HDFS |
+| cim | 云通信，不推荐 |
+| cis | 容器实例服务，不推荐 |
+| ckafka | 消息队列 Ckafka |
+| clb | 负载均衡 |
+| cloudaudit | 云审计 |
+| cloudhsm | 数据加密服务 |
+| cme | 腾讯云剪 |
+| cmq | 消息队列 CMQ |
+| cms | 内容安全 |
+| cpdp | 企业收付平台 |
+| cr | 金融联络机器人 |
+| cvm | 云服务器 |
+| cws | 漏洞扫描服务 |
+| dayu | 大禹网络安全 |
+| dbbrain | 数据库智能管家 |
+| dc | 专线接入 |
+| dcdb | 分布式数据库 TDSQL |
+| domain | 域名注册 |
+| drm | 数字版权管理 |
+| ds | 电子合同服务 |
+| dts | 数据传输服务 DTS |
+| ecc | 英语作文批改 |
+| ecdn | 全站加速网络 |
+| ecm | 边缘计算模块 |
+| emr | 弹性 MapReduce |
+| es | Elasticsearch服务 |
+| facefusion | 人脸融合 |
+| faceid | 人脸核身（云智慧眼） |
+| fmu | 人脸试妆 |
+| ft | 人像变换 |
+| gaap | 全球应用加速 |
+| gme | 游戏多媒体引擎 |
+| gs | 云游戏解决方案 |
+| gse | 游戏服务器引擎 |
+| habo | 样本智能分析平台 |
+| hcm | 数学作业批改 |
+| iai | 人脸识别 |
+| ic | 物联卡 |
+| iot | 加速物联网套件，不推荐 |
+| iotcloud | 物联网通信 |
+| iotexplorer | 物联网开发平台 |
+| iottid | 物联网设备身份认证TID |
+| iotvideo | 物联网智能视频服务 |
+| kms | 密钥管理系统 |
+| live | 直播 |
+| mariadb | 云数据库 MariaDB |
+| memcached | 云数据库 Memcached |
+| mongodb | 云数据库 MongoDB |
+| monitor | 云监控 |
+| mps | 视频处理 |
+| ms | 应用安全 |
+| msp | 迁移服务平台 |
+| mvj | 营销价值判断，不推荐 |
+| nlp | 腾讯知文自然语言处理 |
+| npp | 号码保护 |
+| ocr | 文字识别 |
+| organization | 企业组织 |
+| partners | 渠道合作伙伴 |
+| postgres | 云数据库 PostgreSQL |
+| redis | 云数据库 Redis |
+| scf | 云函数 |
+| smpn | 营销号码安全 |
+| sms | 短信 |
+| soe | 智聆口语评测 |
+| solar | 智汇零售，不推荐 |
+| sqlserver | 云数据库 SQL Server |
+| ssl | 证书 |
+| ssm | 凭据管理服务 |
+| sts | 安全凭证服务 |
+| tag | 标签 |
+| tav | 文件检测，不推荐 |
+| tbaas | TBaaS |
+| tbm | 腾讯优评 |
+| tbp | 腾讯智能对话平台 |
+| tcaplusdb | 游戏数据库 TcaplusDB |
+| tcb | 云开发 |
+| tci | 腾讯智学课堂分析 |
+| tcr | 容器镜像服务 |
+| tia | 智能钛机器学习，不推荐 |
+| ticm | 智能鉴黄，不推荐 |
+| tics | 威胁情报云查 |
+| tiems | 智能钛弹性模型服务 |
+| tiia | 图像分析 |
+| tione | 智能钛机器学习平台 |
+| tiw | 互动白板 |
+| tke | 容器服务 |
+| tkgdq | 腾讯知识图谱数据查询 |
+| tmt | 机器翻译 |
+| trtc | 实时音视频 |
+| tsf | 腾讯分布式服务框架 |
+| tts | 语音合成 |
+| vod | 点播 |
+| vpc | 私有网络 |
+| wss | SSL证书管理服务 |
+| youmall | 腾讯优Mall，不推荐 |
+| yunjing | 主机安全 |
+| yunsou | 云搜 |
