@@ -964,6 +964,8 @@ func operateClusterVip(ctx context.Context, svc *tke.Client, clusterID, operatio
 
 	req := tke.NewCreateClusterEndpointVipRequest()
 	req.ClusterId = &clusterID
+	// make all request can be through
+	req.SecurityPolicies = tccommon.StringPtrs([]string{"0.0.0.0/0"})
 
 	reqStatus := tke.NewDescribeClusterEndpointVipStatusRequest()
 	reqStatus.ClusterId = &clusterID
